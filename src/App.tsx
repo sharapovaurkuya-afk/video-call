@@ -18,29 +18,53 @@ function App() {
   const localVideoRef = useRef<HTMLVideoElement>(null);
   const remoteVideoRef = useRef<HTMLVideoElement>(null);
 
-  const wsRef = useRef<WebSocket | null>(null);
+  const socketRef = useRef<WebSocket | null>(null);
   const peerRef = useRef<RTCPeerConnection | null>(null);
-  const localStreamRef = useRef<MediaStream | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const clientIdRef = useRef(Math.random().toString(36).slice(2, 10));
+  const pendingCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
 
-  const clientIdRef = useRef(crypto.randomUUID());
-  const peerIdRef = useRef<string | null>(null);
-  const peerReadyRef = useRef(false);
-
-  const [localStream, setLocalStream] = useState<MediaStream | null>(null);
-  const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
   const [cameraOn, setCameraOn] = useState(false);
   const [micOn, setMicOn] = useState(false);
-  const [status, setStatus] = useState("Connecting...");
   const [connected, setConnected] = useState(false);
+  const [status, setStatus] = useState("Connecting...");
 
   const sendMessage = (message: object) => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify(message));
+    const socket = socketRef.current;
+
+    if (socket?.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify(message));
+    }
+  };
+
+  const startCamera = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: true,
+        audio: true,
+      });
+
+      streamRef.current = stream;
+
+      if (localVideoRef.current) {
+        localVideoRef.current.srcObject = stream;
+      }
+
+      setCameraOn(true);
+      setMicOn(true);
+
+      return stream;
+    } catch (error) {
+      console.error("Camera error:", error);
+      setStatus("Camera access denied");
+      return null;
     }
   };
 
   const createPeerConnection = () => {
-    if (peerRef.current) return peerRef.current;
+    if (peerRef.current) {
+      return peerRef.current;
+    }
 
     const pc = new RTCPeerConnection({
       iceServers: [
@@ -48,6 +72,16 @@ function App() {
         { urls: "stun:stun1.l.google.com:19302" },
       ],
     });
+
+    peerRef.current = pc;
+
+    const stream = streamRef.current;
+
+    if (stream) {
+      stream.getTracks().forEach((track) => {
+        pc.addTrack(track, stream);
+      });
+    }
 
     pc.onicecandidate = (event) => {
       if (event.candidate) {
@@ -59,64 +93,135 @@ function App() {
     };
 
     pc.ontrack = (event) => {
-      let stream = remoteStream;
-
-      if (!stream) {
-        stream = new MediaStream();
-        setRemoteStream(stream);
-      }
-
-      stream.addTrack(event.track);
-
       if (remoteVideoRef.current) {
-        remoteVideoRef.current.srcObject = stream;
+        remoteVideoRef.current.srcObject = event.streams[0];
       }
+
+      setConnected(true);
+      setStatus("Connected");
     };
 
     pc.onconnectionstatechange = () => {
+      console.log("WebRTC state:", pc.connectionState);
+
       if (pc.connectionState === "connected") {
-        setStatus("Connected");
         setConnected(true);
-      } else if (
+        setStatus("Connected");
+      }
+
+      if (
         pc.connectionState === "disconnected" ||
         pc.connectionState === "failed"
       ) {
-        setStatus("Connection lost");
+        setConnected(false);
+        setStatus("Connection interrupted");
+      }
+      if (pc.connectionState === "closed") {
         setConnected(false);
       }
     };
 
-    peerRef.current = pc;
-
-    if (localStreamRef.current) {
-      localStreamRef.current.getTracks().forEach((track) => {
-        pc.addTrack(track, localStreamRef.current!);
-      });
-    }
-
     return pc;
   };
 
-  const makeOffer = async () => {
+  const createOffer = async () => {
     const pc = createPeerConnection();
 
-    if (!localStreamRef.current || !peerReadyRef.current) return;
+    try {
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
 
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-
-    sendMessage({
-      type: "offer",
-      offer,
-    });
+      sendMessage({
+        type: "offer",
+        offer,
+      });
+    } catch (error) {
+      console.error("Offer error:", error);
+    }
   };
 
-  useEffect(() => {
-    const ws = new WebSocket(SIGNALING_URL);
-    wsRef.current = ws;
+  const handleOffer = async (offer: RTCSessionDescriptionInit) => {
+    const pc = createPeerConnection();
 
-    ws.onopen = () => {
-      setStatus("Waiting for participant");
+    try {
+      await pc.setRemoteDescription(
+        new RTCSessionDescription(offer)
+      );
+
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+
+      sendMessage({
+        type: "answer",
+        answer,
+      });
+
+      await processPendingCandidates();
+    } catch (error) {
+      console.error("Answer error:", error);
+    }
+  };
+
+  const handleAnswer = async (answer: RTCSessionDescriptionInit) => {
+    const pc = peerRef.current;
+
+    if (!pc) return;
+
+    try {
+      await pc.setRemoteDescription(
+        new RTCSessionDescription(answer)
+      );
+
+      await processPendingCandidates();
+    } catch (error) {
+      console.error("Set answer error:", error);
+    }
+  };
+
+  const handleCandidate = async (
+    candidate: RTCIceCandidateInit
+  ) => {
+    const pc = peerRef.current;
+
+    if (!pc || !pc.remoteDescription) {
+      pendingCandidatesRef.current.push(candidate);
+      return;
+    }
+
+    try {
+      await pc.addIceCandidate(
+        new RTCIceCandidate(candidate)
+      );
+    } catch (error) {
+      console.error("ICE candidate error:", error);
+    }
+  };
+
+  const processPendingCandidates = async () => {
+    const pc = peerRef.current;
+
+    if (!pc || !pc.remoteDescription) return;
+
+    const candidates = pendingCandidatesRef.current;
+    pendingCandidatesRef.current = [];
+
+    for (const candidate of candidates) {
+      try {
+        await pc.addIceCandidate(
+          new RTCIceCandidate(candidate)
+        );
+      } catch (error) {
+        console.error("Pending ICE error:", error);
+      }
+    }
+  };
+
+  const connectSignaling = () => {
+    const socket = new WebSocket(SIGNALING_URL);
+    socketRef.current = socket;
+
+    socket.onopen = () => {
+      setStatus("Waiting for participant...");
 
       sendMessage({
         type: "ready",
@@ -124,155 +229,95 @@ function App() {
       });
     };
 
-    ws.onmessage = async (event) => {
-      const message = JSON.parse(event.data);
+    socket.onmessage = async (event) => {
+      try {
+        const message = JSON.parse(event.data);
 
-      if (message.type === "ready") {
-        peerIdRef.current = message.clientId;
-        peerReadyRef.current = true;
-        setStatus("Participant found");
+        console.log("Received:", message);
 
-        if (
-          localStreamRef.current &&
-          clientIdRef.current < message.clientId
-        ) {
-          await makeOffer();
+        if (message.type === "peer-left") {
+          peerRef.current?.close();
+          peerRef.current = null;
+
+          pendingCandidatesRef.current = [];
+
+          if (remoteVideoRef.current) {
+            remoteVideoRef.current.srcObject = null;
+          }
+
+          setConnected(false);
+          setStatus("Participant left");
+          return;
         }
 
-        return;
-      }
+        if (message.type === "ready") {
+          if (!message.clientId) return;
 
-      if (message.type === "offer") {
-        const pc = createPeerConnection();
+          // Только один участник создаёт offer.
+          if (clientIdRef.current > message.clientId) {
+            await createOffer();
+          }
 
-        await pc.setRemoteDescription(
-          new RTCSessionDescription(message.offer)
-        );
-
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-
-        sendMessage({
-          type: "answer",
-          answer,
-        });
-
-        return;
-      }
-
-      if (message.type === "answer") {
-        const pc = peerRef.current;
-
-        if (pc) {
-          await pc.setRemoteDescription(
-            new RTCSessionDescription(message.answer)
-          );
+          setStatus("Participant found");
+          return;
         }
 
-        return;
-      }
+        if (message.type === "offer") {
+          await handleOffer(message.offer);
+          return;
+        }
 
-      if (message.type === "ice-candidate") {
-        const pc = peerRef.current;
+        if (message.type === "answer") {
+          await handleAnswer(message.answer);
+          return;
+        }
 
-        if (pc && message.candidate) {
-          try {
-            await pc.addIceCandidate(
-              new RTCIceCandidate(message.candidate)
-            );
-          } catch (error) {
-            console.error("ICE error:", error);
+        if (message.type === "ice-candidate") {
+          if (message.candidate) {
+            await handleCandidate(message.candidate);
           }
         }
-
-        return;
-      }
-
-      if (message.type === "peer-left") {
-        peerReadyRef.current = false;
-        peerIdRef.current = null;
-
-        peerRef.current?.close();
-        peerRef.current = null;
-
-        setRemoteStream(null);
-        setConnected(false);
-        setStatus("Participant left");
-
-        if (remoteVideoRef.current) {
-          remoteVideoRef.current.srcObject = null;
-        }
+      } catch (error) {
+        console.error("WebSocket message error:", error);
       }
     };
 
-    ws.onerror = () => {
-      setStatus("WebSocket error");
+    socket.onerror = (error) => {
+      console.error("WebSocket error:", error);
+      setStatus("Signaling server error");
     };
 
-    ws.onclose = () => {
+    socket.onclose = () => {
       setStatus("Disconnected from server");
     };
+  };
+
+  useEffect(() => {
+    const initialize = async () => {
+      await startCamera();
+      connectSignaling();
+    };
+
+    void initialize();
 
     return () => {
-      ws.close();
       peerRef.current?.close();
+      socketRef.current?.close();
+
+      streamRef.current?.getTracks().forEach((track) => {
+        track.stop();
+      });
     };
   }, []);
 
-  useEffect(() => {
-    if (localVideoRef.current && localStream) {
-      localVideoRef.current.srcObject = localStream;
-    }
-  }, [localStream]);
-
-  useEffect(() => {
-    if (remoteVideoRef.current && remoteStream) {
-      remoteVideoRef.current.srcObject = remoteStream;
-    }
-  }, [remoteStream]);
-
-  const startCamera = async () => {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: true,
-        audio: true,
-      });
-
-      localStreamRef.current = stream;
-      setLocalStream(stream);
-
-      setCameraOn(true);
-      setMicOn(true);
-
-      const pc = createPeerConnection();
-
-      stream.getTracks().forEach((track) => {
-        pc.addTrack(track, stream);
-      });
-
-      setStatus("Camera and microphone ready");
-
-      if (
-        peerReadyRef.current &&
-        clientIdRef.current < (peerIdRef.current || "")
-      ) {
-        await makeOffer();
-      }
-    } catch (error) {
-      console.error(error);
-      setStatus("Camera access denied");
-    }
-  };
-
   const toggleCamera = () => {
-    if (!localStreamRef.current) {
-      void startCamera();
-      return;
-    }
+    const stream = streamRef.current;
+
+    if (!stream) return;
 
     const nextState = !cameraOn;
 
-    localStreamRef.current.getVideoTracks().forEach((track) => {
+    stream.getVideoTracks().forEach((track) => {
       track.enabled = nextState;
     });
 
@@ -280,34 +325,31 @@ function App() {
   };
 
   const toggleMicrophone = () => {
-    if (!localStreamRef.current) {
-      void startCamera();
-      return;
-    }
+    const stream = streamRef.current;
+
+    if (!stream) return;
 
     const nextState = !micOn;
 
-    localStreamRef.current.getAudioTracks().forEach((track) => {
+    stream.getAudioTracks().forEach((track) => {
       track.enabled = nextState;
     });
 
     setMicOn(nextState);
   };
 
-  const stopCamera = () => {
-    localStreamRef.current?.getTracks().forEach((track) => track.stop());
-
-    localStreamRef.current = null;
-    setLocalStream(null);
-    setCameraOn(false);
-    setMicOn(false);
-
+  const leaveCall = () => {
     peerRef.current?.close();
     peerRef.current = null;
 
-    setRemoteStream(null);
-    setConnected(false);
-    setStatus("Call ended");
+    socketRef.current?.close();
+    socketRef.current = null;
+
+    streamRef.current?.getTracks().forEach((track) => {
+      track.stop();
+    });
+
+    streamRef.current = null;
 
     if (localVideoRef.current) {
       localVideoRef.current.srcObject = null;
@@ -316,6 +358,11 @@ function App() {
     if (remoteVideoRef.current) {
       remoteVideoRef.current.srcObject = null;
     }
+
+    setCameraOn(false);
+    setMicOn(false);
+    setConnected(false);
+    setStatus("Call ended");
   };
 
   return (
@@ -332,6 +379,7 @@ function App() {
             <ShieldCheck size={17} />
             <span>Secure connection</span>
           </div>
+
           <button className="icon-button" aria-label="Settings">
             <Settings size={20} />
           </button>
@@ -392,15 +440,17 @@ function App() {
               playsInline
             />
 
-            {!remoteStream && (
+            {!connected && (
               <div className="video-placeholder">
                 <div className="avatar remote-avatar">
                   <Users size={32} />
                 </div>
+
                 <h3>Waiting for participant</h3>
                 <p>Your conversation partner will appear here</p>
+
                 <span className="waiting-indicator">
-                  {connected ? "Connected" : "Waiting to connect..."}
+                  Waiting to connect...
                 </span>
               </div>
             )}
@@ -424,7 +474,6 @@ function App() {
             <button
               className={`control-button ${micOn ? "" : "control-off"}`}
               onClick={toggleMicrophone}
-              title="Toggle microphone"
             >
               {micOn ? <Mic size={21} /> : <MicOff size={21} />}
               <span>Microphone</span>
@@ -433,21 +482,19 @@ function App() {
             <button
               className={`control-button ${cameraOn ? "" : "control-off"}`}
               onClick={toggleCamera}
-              title="Toggle camera"
             >
               {cameraOn ? <Video size={21} /> : <VideoOff size={21} />}
               <span>Camera</span>
             </button>
 
-            <button className="control-button" title="Share screen" disabled>
+            <button className="control-button" disabled>
               <MonitorUp size={21} />
               <span>Share screen</span>
             </button>
 
             <button
               className="control-button leave-button"
-              onClick={stopCamera}
-              title="Stop camera and microphone"
+              onClick={leaveCall}
             >
               <PhoneOff size={21} />
               <span>Leave</span>
