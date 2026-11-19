@@ -24,14 +24,13 @@ function App() {
 
   const remoteStreamRef = useRef<MediaStream>(new MediaStream());
 
-  const clientIdRef = useRef(
-    Math.random().toString(36).substring(2, 10)
-  );
+  const makingOfferRef = useRef(false);
+  const ignoreOfferRef = useRef(false);
+  const politeRef = useRef(false);
 
-  const peerReadyRef = useRef(false);
-  const offerCreatedRef = useRef(false);
-  const helloIntervalRef = useRef<number | null>(null);
   const pendingCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
+
+ 
 
   const [cameraOn, setCameraOn] = useState(false);
   const [micOn, setMicOn] = useState(false);
@@ -67,6 +66,25 @@ function App() {
       console.error("Camera error:", error);
       setStatus("Camera access denied");
       return null;
+    }
+  };
+
+  const processPendingCandidates = async () => {
+    const pc = peerRef.current;
+
+    if (!pc?.remoteDescription) return;
+
+    const candidates = pendingCandidatesRef.current;
+    pendingCandidatesRef.current = [];
+
+    for (const candidate of candidates) {
+      try {
+        await pc.addIceCandidate(
+          new RTCIceCandidate(candidate)
+        );
+      } catch (error) {
+        console.error("ICE candidate error:", error);
+      }
     }
   };
 
@@ -120,8 +138,33 @@ function App() {
       setStatus("Connected");
     };
 
+    pc.onnegotiationneeded = async () => {
+      try {
+        if (
+          socketRef.current?.readyState !== WebSocket.OPEN
+        ) {
+          return;
+        }
+
+        makingOfferRef.current = true;
+
+        await pc.setLocalDescription();
+
+        sendMessage({
+          type: "offer",
+          offer: pc.localDescription,
+        });
+
+        console.log("Offer sent");
+      } catch (error) {
+        console.error("Negotiation error:", error);
+      } finally {
+        makingOfferRef.current = false;
+      }
+    };
+
     pc.onconnectionstatechange = () => {
-      console.log("WebRTC state:", pc.connectionState);
+      console.log("Connection state:", pc.connectionState);
 
       if (pc.connectionState === "connected") {
         setConnected(true);
@@ -143,37 +186,38 @@ function App() {
     return pc;
   };
 
-  const createOffer = async () => {
-    try {
-      const pc = createPeerConnection();
-
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-
-      sendMessage({
-        type: "offer",
-        offer: pc.localDescription,
-      });
-
-      console.log("OFFER SENT");
-      setStatus("Offer sent...");
-    } catch (error) {
-      console.error("Create offer error:", error);
-      setStatus("Offer error");
-    }
-  };
-
   const handleOffer = async (
     offer: RTCSessionDescriptionInit
   ) => {
     try {
       const pc = createPeerConnection();
 
+      const offerCollision =
+        makingOfferRef.current ||
+        pc.signalingState !== "stable";
+
+      ignoreOfferRef.current =
+        !politeRef.current && offerCollision;
+
+      if (ignoreOfferRef.current) {
+        console.log("Offer ignored");
+        return;
+      }
+
+      if (offerCollision && politeRef.current) {
+        await pc.setLocalDescription({
+          type: "rollback",
+        });
+      }
+
       await pc.setRemoteDescription(
         new RTCSessionDescription(offer)
       );
 
+      await processPendingCandidates();
+
       const answer = await pc.createAnswer();
+
       await pc.setLocalDescription(answer);
 
       sendMessage({
@@ -181,12 +225,10 @@ function App() {
         answer: pc.localDescription,
       });
 
-      await processPendingCandidates();
-
-      console.log("ANSWER SENT");
+      console.log("Answer sent");
       setStatus("Connecting...");
     } catch (error) {
-      console.error("Handle offer error:", error);
+      console.error("Offer error:", error);
     }
   };
 
@@ -204,9 +246,9 @@ function App() {
 
       await processPendingCandidates();
 
-      console.log("ANSWER RECEIVED");
+      console.log("Answer received");
     } catch (error) {
-      console.error("Handle answer error:", error);
+      console.error("Answer error:", error);
     }
   };
 
@@ -215,7 +257,7 @@ function App() {
   ) => {
     const pc = peerRef.current;
 
-    if (!pc || !pc.remoteDescription) {
+    if (!pc?.remoteDescription) {
       pendingCandidatesRef.current.push(candidate);
       return;
     }
@@ -225,36 +267,10 @@ function App() {
         new RTCIceCandidate(candidate)
       );
     } catch (error) {
-      console.error("ICE error:", error);
-    }
-  };
-
-  const processPendingCandidates = async () => {
-    const pc = peerRef.current;
-
-    if (!pc?.remoteDescription) return;
-
-    const candidates = pendingCandidatesRef.current;
-    pendingCandidatesRef.current = [];
-
-    for (const candidate of candidates) {
-      try {
-        await pc.addIceCandidate(
-          new RTCIceCandidate(candidate)
-        );
-      } catch (error) {
-        console.error("Pending ICE error:", error);
+      if (!ignoreOfferRef.current) {
+        console.error("ICE error:", error);
       }
     }
-  };
-
-  const sendReady = () => {
-    sendMessage({
-      type: "ready",
-      clientId: clientIdRef.current,
-    });
-
-    console.log("READY SENT");
   };
 
   const connectSignaling = () => {
@@ -263,29 +279,35 @@ function App() {
 
     socket.onopen = () => {
       console.log("WebSocket connected");
-      setStatus("Waiting for participant...");
+      setStatus("Negotiating connection...");
 
-      sendReady();
+      // После подключения запускаем WebRTC переговоры
+      const pc = peerRef.current;
 
-      // Повторяем READY, чтобы второй участник обнаружился,
-      // даже если первое сообщение было отправлено слишком рано.
-      helloIntervalRef.current = window.setInterval(() => {
-        if (!peerReadyRef.current) {
-          sendReady();
-        }
-      }, 1500);
+      if (pc && pc.signalingState === "stable") {
+        pc.createOffer()
+          .then((offer) => pc.setLocalDescription(offer))
+          .then(() => {
+            sendMessage({
+              type: "offer",
+              offer: pc.localDescription,
+            });
+
+            console.log("Initial offer sent");
+          })
+          .catch((error) => {
+            console.error("Initial offer error:", error);
+          });
+      }
     };
 
     socket.onmessage = async (event) => {
       try {
         const message = JSON.parse(event.data);
 
-        console.log("MESSAGE RECEIVED:", message);
+        console.log("Message received:", message);
 
         if (message.type === "peer-left") {
-          peerReadyRef.current = false;
-          offerCreatedRef.current = false;
-
           peerRef.current?.close();
           peerRef.current = null;
 
@@ -298,42 +320,6 @@ function App() {
 
           setConnected(false);
           setStatus("Participant left");
-          return;
-        }
-
-        if (message.type === "ready") {
-          if (!message.clientId) return;
-
-          // Игнорируем собственное сообщение, если сервер
-          // вдруг возвращает его отправителю
-          if (message.clientId === clientIdRef.current) {
-            return;
-          }
-
-          const wasReady = peerReadyRef.current;
-          peerReadyRef.current = true;
-
-          if (helloIntervalRef.current !== null) {
-            clearInterval(helloIntervalRef.current);
-            helloIntervalRef.current = null;
-          }
-
-          setStatus("Participant found");
-
-          // Отвечаем READY один раз
-          if (!wasReady) {
-            sendReady();
-          }
-
-          // Только один из двух клиентов создаёт Offer
-          if (
-            clientIdRef.current > message.clientId &&
-            !offerCreatedRef.current
-          ) {
-            offerCreatedRef.current = true;
-            await createOffer();
-          }
-
           return;
         }
 
@@ -366,7 +352,7 @@ function App() {
           }
         }
       } catch (error) {
-        console.error("Signaling message error:", error);
+        console.error("Message error:", error);
       }
     };
 
@@ -377,12 +363,6 @@ function App() {
 
     socket.onclose = () => {
       console.log("WebSocket disconnected");
-
-      if (helloIntervalRef.current !== null) {
-        clearInterval(helloIntervalRef.current);
-        helloIntervalRef.current = null;
-      }
-
       setStatus("Signaling disconnected");
     };
   };
@@ -391,18 +371,17 @@ function App() {
     const initialize = async () => {
       const stream = await startCamera();
 
-      if (stream) {
-        connectSignaling();
-      }
+      if (!stream) return;
+
+      // Создаём PeerConnection до подключения WebSocket
+      createPeerConnection();
+
+      connectSignaling();
     };
 
     initialize();
 
     return () => {
-      if (helloIntervalRef.current !== null) {
-        clearInterval(helloIntervalRef.current);
-      }
-
       peerRef.current?.close();
       socketRef.current?.close();
 
@@ -414,6 +393,7 @@ function App() {
 
   const toggleCamera = () => {
     const stream = localStreamRef.current;
+
     if (!stream) return;
 
     const nextState = !cameraOn;
@@ -427,6 +407,7 @@ function App() {
 
   const toggleMicrophone = () => {
     const stream = localStreamRef.current;
+
     if (!stream) return;
 
     const nextState = !micOn;
@@ -445,17 +426,11 @@ function App() {
     socketRef.current?.close();
     socketRef.current = null;
 
-    if (helloIntervalRef.current !== null) {
-      clearInterval(helloIntervalRef.current);
-      helloIntervalRef.current = null;
-    }
-
     localStreamRef.current?.getTracks().forEach((track) => {
       track.stop();
     });
 
     localStreamRef.current = null;
-
     remoteStreamRef.current = new MediaStream();
 
     if (localVideoRef.current) {
@@ -557,7 +532,7 @@ function App() {
                 <p>Your conversation partner will appear here</p>
 
                 <span className="waiting-indicator">
-                  Waiting to connect...
+                  {status}
                 </span>
               </div>
             )}
